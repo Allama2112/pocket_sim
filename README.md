@@ -1,20 +1,6 @@
-# Pocket Simulator
+# Pokemon TCG Pocket Simulator
 
-A web-based simulator for Pokémon TCG Pocket, allowing deck creation and battles.
-
-## Tech Stack
-
-- **Frontend:** React, Axios, Tailwind CSS  
-- **Backend:** FastAPI (Python)  
-- **Database:** (To be connected, e.g., Supabase)
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.10+  
-- Node.js and npm  
-- (Optional) Virtual environment tool like `venv`
+Work in progress 👍
 
 ### Backend Setup
 
