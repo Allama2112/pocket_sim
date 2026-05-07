@@ -1,0 +1,3 @@
+[submodule "backend/app/data/cards"]
+	path = backend/app/data/cards
+	url = https://github.com/hugoburguete/pokemon-tcg-pocket-card-database.git
