@@ -47,6 +47,9 @@ class BattleService:
             return
 
         card = player.deck.pop()
+
+        if card is None:
+            return
         player.hand.append(card)
 
     # =========================
@@ -89,27 +92,42 @@ class BattleService:
     def play_pokemon(self, game, player_id, card):
         player = game.players[player_id]
 
-        player.hand.remove(card["id"])
-
-        pokemon_state = {
-            "card": card,
-            "damage": 0,
-            "turn_played": game.turn_number,
-            "evolved_this_turn": False,
-            "tool": None,
-        }
+        placement = None
 
         if player.active is None:
-            player.active = pokemon_state
-        else:
-            if len(player.bench) >= 3:
-                return {"error": "Bench full"}
+            player.active = {
+                "card": card,
+                "damage": 0,
+                "energy": 0,
+                "turn_played": game.turn_number,
+                "tool": None,
+                "evolved_this_turn": False
+            }
+            placement = "active"
 
-            player.bench.append(pokemon_state)
+        elif len(player.bench) < 3:
+            player.bench.append({
+                "card": card,
+                "damage": 0,
+                "energy": 0,
+                "turn_played": game.turn_number,
+                "tool": None,
+                "evolved_this_turn": False
+            })
+            placement = "bench"
+
+        else:
+            return {"error": "Bench full"}
+
+        for i, c in enumerate(player.hand):
+            if c.get("id") == card.get("id"):
+                player.hand.pop(i)
+                break
 
         self.event_engine.emit("on_play_pokemon", game, {
             "player": player_id,
-            "card": card
+            "card": card,
+            "placement": placement
         })
 
         self.effect_resolver.resolve(
@@ -119,7 +137,10 @@ class BattleService:
             "on_play_pokemon"
         )
 
-        return {"message": "Pokemon played"}
+        return {
+            "message": "Pokemon played",
+            "placement": placement
+        }
 
     # =========================
     # SUPPORTER PLAY
@@ -130,6 +151,9 @@ class BattleService:
 
         if player.supporter_played_this_turn:
             return {"error": "Supporter already played this turn"}
+        
+        if game.turn_phase != "main":
+            return {"error": "Cannot play supporter outside main phase"}
 
         player.supporter_played_this_turn = True
         player.hand.remove(card["id"])
@@ -242,31 +266,30 @@ class BattleService:
             p["evolved_this_turn"] = False
 
     def start_turn(self, game):
-        if game.game_over:
-            return
-        
         player = game.players[game.current_player]
 
         self.reset_turn_flags(player)
+
+        game.turn_phase = "start"
 
         self.event_engine.emit("on_turn_start", game, {
             "player": game.current_player
         })
 
-        self.resolve_stadium(game, "on_turn_start")
-
+        # draw phase
         self.draw_card(game, game.current_player)
 
-        if not (
-            game.turn_number == 1
-            and game.current_player == game.first_player
-        ):
+        # energy rule (first turn exception already handled)
+        if not (game.turn_number == 1 and game.current_player == game.first_player):
             player.energy += 1
+
+        player.energy_attached_this_turn = False
+        player.has_attacked_this_turn = False
 
         player.supporter_played_this_turn = False
         player.used_ability_this_turn = set()
 
-        self.resolve_all_abilities(game, "on_turn_start")
+        game.turn_phase = "main"
 
     def end_turn(self, game):
         self.event_engine.emit("on_turn_end", game, {
@@ -284,6 +307,8 @@ class BattleService:
 
         self.start_turn(game)
 
+        game.turn_phase = "end"
+
     # =========================
     # ATTACK SYSTEM
     # =========================
@@ -296,6 +321,9 @@ class BattleService:
 
         if player.active is None:
             return {"error": "No active pokemon"}
+        
+        if player.has_attacked_this_turn:
+            return {"error": "Already attacked this turn"}
 
         attacker = player.active
         defender_id = "p2" if player_id == "p1" else "p1"
@@ -365,6 +393,8 @@ class BattleService:
 
         self.game_flow.check_win(game)
 
+        player.has_attacked_this_turn = True
+
         return {
             "message": "Attack successful",
             "damage": damage
@@ -395,31 +425,38 @@ class BattleService:
         if damage < hp:
             return
 
-        # KO happened
-        opponent_id = "p2" if player_id == "p1" else "p1"
+        knocked_out = pokemon
 
-        # resolve abilities BEFORE removal
-        self.resolve_all_abilities(game, "on_knockout")
+        # ---- POINT SYSTEM ----
+        # default 1 point per KO
+        points_awarded = 1
+
+        # OPTIONAL: rarity scaling example
+        rarity = knocked_out["card"].get("rarity", "Common")
+
+        if rarity == "Rare":
+            points_awarded = 2
+        elif rarity == "Ultra Rare":
+            points_awarded = 3
+
+        self.add_points(game, player_id, points_awarded)
+
+        # move to discard
+        player.discard.append(knocked_out["card"]["id"])
+
+        if knocked_out["tool"]:
+            player.discard.append(knocked_out["tool"]["id"])
+
+        player.active = None
 
         self.event_engine.emit("on_knockout", game, {
             "player": player_id,
-            "pokemon": pokemon
+            "pokemon": knocked_out,
+            "points": points_awarded
         })
 
-        # award points to opponent
-        prize_points = pokemon["card"].get("prize_points", 1)
-        game.points[opponent_id] += prize_points
-
-        # remove tool if exists
-        if pokemon["tool"]:
-            player.discard.append(pokemon["tool"]["id"])
-
-        # remove pokemon
-        player.discard.append(pokemon["card"]["id"])
-        player.active = None
-
-        # check win AFTER scoring
-        self.check_win(game)
+        # check if game ended after KO
+        self.check_game_over(game)
 
     def check_win(self, game):
         p1 = game.points["p1"]
@@ -550,6 +587,82 @@ class BattleService:
                     p,
                     trigger
                 )
+
+    def attach_energy(self, game, player_id, target_slot, target_index=None):
+        player = game.players[player_id]
+
+        if game.game_over:
+            return {"error": "Game is over"}
+
+        if player.energy <= 0:
+            return {"error": "No energy available"}
+
+        if player.energy_attached_this_turn:
+            return {"error": "Energy already attached this turn"}
+
+        # locate target
+        if target_slot == "active":
+            target = player.active
+        else:
+            if target_index is None:
+                return {"error": "Missing bench index"}
+            target = player.bench[target_index]
+
+        if target is None:
+            return {"error": "No target Pokémon"}
+
+        # attach (simple version)
+        target.setdefault("energy", 0)
+        target["energy"] += 1
+
+        player.energy -= 1
+        player.energy_attached_this_turn = True
+
+        return {"message": "Energy attached"}
+    
+    def add_points(self, game, player_id, amount):
+        game.points[player_id] += amount
+
+        # check win condition immediately
+        if game.points[player_id] >= 3:
+            self.check_game_over(game)
+
+
+    def check_game_over(self, game):
+        p1 = game.points["p1"]
+        p2 = game.points["p2"]
+
+        # both hit 3+
+        if p1 >= 3 and p2 >= 3:
+            if p1 > p2:
+                game.winner = "p1"
+            elif p2 > p1:
+                game.winner = "p2"
+            else:
+                game.winner = "draw"
+
+            game.game_over = True
+            return
+
+        # single winner
+        if p1 >= 3:
+            game.winner = "p1"
+            game.game_over = True
+            return
+
+        if p2 >= 3:
+            game.winner = "p2"
+            game.game_over = True
+            return
+
+        # deck loss condition (optional rule you already had)
+        if len(game.players["p1"].deck) == 0 and len(game.players["p1"].hand) == 0:
+            game.winner = "p2"
+            game.game_over = True
+
+        if len(game.players["p2"].deck) == 0 and len(game.players["p2"].hand) == 0:
+            game.winner = "p1"
+            game.game_over = True
 
 
 # global instance
